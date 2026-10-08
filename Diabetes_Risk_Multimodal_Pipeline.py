@@ -1439,3 +1439,121 @@
 -- MAGIC print("\nObservacao: As imagens de Raio-X de torax sao visualmente semelhantes")
 -- MAGIC print("   entre pacientes com e sem diabetes, confirmando que nao ha padrao")
 -- MAGIC print("   visual de diabetes no Raio-X de torax.")
+
+-- COMMAND ----------
+
+-- DBTITLE 1,POST 1 - LinkedIn - Pipeline Multimodal
+-- MAGIC %md
+-- MAGIC # 📱 POST 1 — LinkedIn
+-- MAGIC
+-- MAGIC ## Previsão de Risco de Diabetes: Pipeline Multimodal (Dados Clínicos + Raio-X)
+-- MAGIC
+-- MAGIC ---
+-- MAGIC
+-- MAGIC Recentemente explorei como a combinação de dados clínicos numéricos (Glicose, IMC, Idade, Pressão Arterial) com imagens radiológicas (Raios-X do tórax) num pipeline multimodal pode elevar a precisão do rastreio do risco de diabetes e complicações associadas.
+-- MAGIC
+-- MAGIC O projeto foi construído em Databricks e segue uma arquitetura end-to-end de 5 etapas. Neste primeiro post partilho a ETAPA 1: Ingestão, Harmonização e Fusão de Datasets.
+-- MAGIC
+-- MAGIC ### 🔹 ETAPA 1 — Ingestão e Fusão de Dados
+-- MAGIC
+-- MAGIC Os dados vieram de duas fontes distintas, fundidos por ID de paciente:
+-- MAGIC
+-- MAGIC 📊 **Ramo Clínico (Tabular)** — Pima Indians Diabetes Dataset
+-- MAGIC • 768 registos | 8 features clínicas + target (Outcome: 0/1)
+-- MAGIC • Variáveis: Glicose, IMC, Pressão Arterial, Idade, Insulina, Gravidezes, Histórico Familiar
+-- MAGIC • 268 pacientes com risco de diabetes | 500 sem risco
+-- MAGIC
+-- MAGIC 🏥 **Ramo de Imagem (Visão)** — ChestMNIST (NIH Chest X-ray)
+-- MAGIC • 768 imagens de Raio-X de tórax em formato 28×28 pixéis
+-- MAGIC • 14 labels de doenças torácicas (Atelectasia, Derrame Pleural, Infiltration, etc.)
+-- MAGIC • 327/768 pacientes com pelo menos 1 doença torácica detectada
+-- MAGIC
+-- MAGIC 🔗 **Fusão Contratual (Data Linking)**
+-- MAGIC Como os datasets são de fontes distintas (Pima ≠ NIH), a fusão foi feita por alinhamento sintético: cada paciente Pima (ID 0-767) recebe uma imagem de Raio-X correspondente. O rótulo de diabetes (Outcome) vem sempre do dataset clínico.
+-- MAGIC
+-- MAGIC ### 📐 Arquitetura do Pipeline
+-- MAGIC
+-- MAGIC 1️⃣ Ingestão, Harmonização e Fusão de Datasets\n
+-- MAGIC 2️⃣ Pré-Processamento (imputação de zeros impossíveis, normalização, augmentation)\n
+-- MAGIC 3️⃣ Engenharia de Features (embeddings visuais + features derivadas + late fusion)\n
+-- MAGIC 4️⃣ Treino de 3 modelos (A: tabular, B: imagem, C: multimodal)\n
+-- MAGIC 5️⃣ Avaliação Clínica e Perguntas de Negócio
+-- MAGIC
+-- MAGIC No próximo post: os resultados dos 3 modelos e o que descobrimos sobre a relação entre Raio-X e diabetes! 🩻
+-- MAGIC
+-- MAGIC ---
+-- MAGIC
+-- MAGIC **Stack:** Databricks | Python | scikit-learn | Unity Catalog | Delta Lake | ChestMNIST | Matplotlib
+-- MAGIC
+-- MAGIC #DataScience #MachineLearning #HealthcareAI #Diabetes #MultimodalAI #Databricks #MedicalImaging #Python #DataEngineering #AIinHealthcare
+
+-- COMMAND ----------
+
+-- DBTITLE 1,POST 2 - LinkedIn - Resultados e Raio-X
+-- MAGIC %md
+-- MAGIC # 📱 POST 2 — LinkedIn
+-- MAGIC
+-- MAGIC ## O Raio-X de Tórax Revela Padrões de Diabetes? Resultados do Pipeline Multimodal
+-- MAGIC
+-- MAGIC ---
+-- MAGIC
+-- MAGIC No post anterior partilhei a arquitetura do pipeline multimodal para previsão de risco de diabetes. Hoje partilho os resultados — e uma descoberta importante sobre a relação entre imagens de Raio-X e diabetes.
+-- MAGIC
+-- MAGIC ### 🏆 Modelação Comparativa (Aproximação Tripla)
+-- MAGIC
+-- MAGIC Treinei 3 modelos para comparar o valor de cada fonte de dados:
+-- MAGIC
+-- MAGIC | Modelo | Input | Accuracy | F1-Score | AUC-ROC |
+-- MAGIC |---|---|---|---|---|
+-- MAGIC | **A — RandomForest** | 12 features clínicas | **77.3%** | **65.3%** | 81.8% |
+-- MAGIC | A — GradientBoosting | 12 features clínicas | 76.6% | 64.0% | 82.9% |
+-- MAGIC | A — LogReg | 12 features clínicas | 72.7% | 57.1% | 82.7% |
+-- MAGIC | C — RF Multimodal | 44 features fundidas | 72.7% | 54.3% | 78.0% |
+-- MAGIC | C — MLP Multimodal | 44 features fundidas | 72.1% | 50.6% | 76.7% |
+-- MAGIC | B — MLP Imagem | 32 componentes visuais | 63.6% | 12.5% | 49.3% |
+-- MAGIC
+-- MAGIC ### 🩻 Descoberta: O Raio-X de tórax NÃO revela padrões de diabetes
+-- MAGIC
+-- MAGIC Foi a pergunta Q5 do projeto: as imagens de Raio-X contêm informação útil para prever diabetes?
+-- MAGIC
+-- MAGIC **Correlações entre doenças torácicas e diabetes:** todas próximas de zero (r < 0.05)
+-- MAGIC
+-- MAGIC **Embeddings visuais (PCA 2D):** os centroides de pacientes com e sem diabetes praticamente sobrepõem-se (distância = 0.406)
+-- MAGIC
+-- MAGIC **Conclusão:** O Raio-X de tórax diagnostica doenças pulmonares, não diabetes. O modelo B (apenas imagem) teve desempenho essencialmente aleatório (AUC ≈ 0.50). A fusão multimodal (Modelo C) ficou pior que o tabular isolado — as features visuais adicionaram ruído.
+-- MAGIC
+-- MAGIC ### 💡 Quando o multimodal será útil?
+-- MAGIC
+-- MAGIC A arquitetura está pronta. Para que a imagem adicione valor, seriam necessárias imagens clinicamente relevantes:
+-- MAGIC • Retinopatia diabética (fundoscopia)\n
+-- MAGIC • Pâncreas em TC/RM\n
+-- MAGIC • Ultrassonografia abdominal (gordura visceral)
+-- MAGIC
+-- MAGIC ### 📊 Features Clínicas Mais Determinantes
+-- MAGIC
+-- MAGIC 1. **Glicose** — 22.7% (a feature dominante)\n
+-- MAGIC 2. **IMC** — 11.7%\n
+-- MAGIC 3. **Rácio Glicose/IMC** — 9.1% (feature derivada que criámos)\n
+-- MAGIC 4. **Histórico Familiar** — 9.1%\n
+-- MAGIC 5. **Insulina** — 8.6%
+-- MAGIC
+-- MAGIC ### 🔑 Síndrome Metabólica e Risco
+-- MAGIC
+-- MAGIC Criei um score composto (0-4) que conta factores de risco acima da mediana:
+-- MAGIC • Score 0 → apenas 2.4% têm diabetes\n
+-- MAGIC • Score 4 → 73.3% têm diabetes\n
+-- MAGIC Cada ponto adicional no score aumenta significativamente o risco.
+-- MAGIC
+-- MAGIC ### 📋 Recomendações de Prevenção (baseadas nos dados)
+-- MAGIC
+-- MAGIC ✅ Manter glicose abaixo de 107 mg/dL\n
+-- MAGIC ✅ Manter IMC abaixo de 32 kg/m²\n
+-- MAGIC ✅ Controlar pressão arterial abaixo de 72 mmHg\n
+-- MAGIC ✅ Monitorar insulina, especialmente em pacientes > 37 anos
+-- MAGIC
+-- MAGIC ---
+-- MAGIC
+-- MAGIC **Stack:** Databricks | Python | scikit-learn | Unity Catalog | Delta Lake | ChestMNIST | Matplotlib\n
+-- MAGIC **Repositório:** github.com/phdprojects/multimodal-diabetes-risk-databricks
+-- MAGIC
+-- MAGIC #DataScience #MachineLearning #HealthcareAI #Diabetes #MultimodalAI #Databricks #MedicalImaging #Python #DataEngineering #AIinHealthcare #Radiology #ClinicalAI
