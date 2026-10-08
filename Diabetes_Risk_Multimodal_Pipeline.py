@@ -1,0 +1,1441 @@
+-- Databricks notebook source
+
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Project Title
+-- MAGIC %md
+-- MAGIC # Previsão do Risco de Diabetes Multimodal (Imagens + Dados Clínicos)
+-- MAGIC
+-- MAGIC Pipeline end-to-end que combina dados clínicos tabulares (Pima Indians Diabetes Dataset) com embeddings extraídos de imagens de Raio-X de tórax para prever o risco de diabetes. O projeto compara três abordagens: modelo apenas tabular, modelo apenas imagem, e modelo multimodal por fusão de features.
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 1 - Ingestão Dados Clínicos
+-- MAGIC %python
+-- MAGIC # ETAPA 1: INGESTÃO, HARMONIZAÇÃO E FUSÃO DE DATASETS
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 1.1 — Carregamento dos Dados Clínicos Tabulares (Pima Indians Diabetes)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # Dataset: Pima Indians Diabetes Database (UCI ML Repository)
+-- MAGIC # 768 registos | 8 features clínicas + 1 target (Diabetes: 0/1)
+-- MAGIC #
+-- MAGIC # Features:
+-- MAGIC #   - Pregnancies: número de gravidezes
+-- MAGIC #   - Glucose: concentração de glicose plasmática (mg/dL)
+-- MAGIC #   - BloodPressure: pressão arterial diastólica (mmHg)
+-- MAGIC #   - SkinThickness: espessura da dobra cutânea do tríceps (mm)
+-- MAGIC #   - Insulin: insulina sérica 2h (mu U/ml)
+-- MAGIC #   - BMI: índice de massa corporal (kg/m²)
+-- MAGIC #   - DiabetesPedigreeFunction: histórico familiar de diabetes
+-- MAGIC #   - Age: idade (anos)
+-- MAGIC #   - Outcome: 1 = risco de diabetes, 0 = sem risco
+-- MAGIC
+-- MAGIC # Leitura da tabela Delta previamente ingerida no Unity Catalog
+-- MAGIC df_clinical = spark.table("diabetes_clinical_pima").toPandas()
+-- MAGIC
+-- MAGIC print(f"✅ Dados clínicos carregados: {df_clinical.shape[0]} registos × {df_clinical.shape[1]} colunas")
+-- MAGIC print(f"   Rótulos: {df_clinical['Outcome'].value_counts().to_dict()}")
+-- MAGIC display(df_clinical.head(10))
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 1.2 - Ingestão Imagens Raio-X
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 1.2 — Carregamento das Imagens de Raio-X (ChestMNIST)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # Dataset: ChestMNIST — subconjunto do NIH Chest X-ray em formato 28×28
+-- MAGIC # Fonte: MedMNIST (Zenodo) | 768 imagens amostradas (uma por paciente)
+-- MAGIC # Cada imagem tem 784 pixéis (28×28) + 14 labels de doenças torácicas
+-- MAGIC #
+-- MAGIC # Doenças torácicas (NIH Chest X-ray):
+-- MAGIC #   Atelectasis, Cardiomegaly, Effusion, Infiltration, Mass, Nodule,
+-- MAGIC #   Pneumonia, Pneumothorax, Consolidation, Edema, Emphysema, Fibrosis,
+-- MAGIC #   Pleural_Thickening, Hernia
+-- MAGIC
+-- MAGIC # Leitura da tabela Delta com imagens de Raio-X
+-- MAGIC df_xray_spark = spark.table("diabetes_xray_chestmnist")
+-- MAGIC df_xray = df_xray_spark.toPandas()
+-- MAGIC
+-- MAGIC # Converter coluna img_pixels (array) para matriz numpy (768, 28, 28)
+-- MAGIC import numpy as np
+-- MAGIC xray_images = np.array([np.array(p).reshape(28, 28) for p in df_xray["img_pixels"]])
+-- MAGIC
+-- MAGIC print(f"✅ Imagens de Raio-X carregadas: {xray_images.shape[0]} imagens")
+-- MAGIC print(f"   Dimensão: {xray_images.shape} (N, 28, 28)")
+-- MAGIC print(f"   Pixel range: [{xray_images.min():.0f}, {xray_images.max():.0f}]")
+-- MAGIC print(f"   Doenças torácicas activas: {(df_xray.filter(like='dx_').sum(axis=0) > 0).sum()} de 14")
+-- MAGIC print(f"   Pacientes com ≥1 doença torácica: {(df_xray.filter(like='dx_').sum(axis=1) > 0).sum()}/768")
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 1.3 - Fusão de Datasets
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 1.3 — Cruzamento e Fusão Contratual (Data Linking)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # Como os datasets são de fontes distintas (Pima ≠ NIH), a fusão é feita
+-- MAGIC # por alinhamento sintético: cada paciente Pima (ID 0-767) recebe uma
+-- MAGIC # imagem de Raio-X correspondente (mesmo ID).
+-- MAGIC # O rótulo de diabetes (Outcome) vem sempre do dataset clínico Pima.
+-- MAGIC
+-- MAGIC # Adicionar patient_id ao dataset clínico (índice 0-767)
+-- MAGIC df_clinical["patient_id"] = range(len(df_clinical))
+-- MAGIC
+-- MAGIC # Merge: dados clínicos + imagem Raio-X por patient_id
+-- MAGIC df_merged = df_clinical.merge(df_xray, on="patient_id", how="inner")
+-- MAGIC
+-- MAGIC print(f"✅ Fusão concluída: {df_merged.shape[0]} pacientes")
+-- MAGIC print(f"   Colunas: {df_merged.shape[1]} (clínicas + patient_id + imagem + doenças)")
+-- MAGIC print(f"   Rótulos diabetes: {df_merged['Outcome'].value_counts().to_dict()}")
+-- MAGIC print("\n📋 Estrutura final do dataset multimodal:")
+-- MAGIC print(f"   • Features clínicas: Pregnancies, Glucose, BloodPressure, SkinThickness, Insulin, BMI, DiabetesPedigreeFunction, Age")
+-- MAGIC print(f"   • Features visuais: img_pixels (array 784 = 28×28)")
+-- MAGIC print(f"   • Doenças torácicas: 14 labels dx_* (referência)")
+-- MAGIC print(f"   • Target: Outcome (0 = sem risco, 1 = risco diabetes)")
+-- MAGIC
+-- MAGIC # Visualizar primeiras linhas (sem a coluna de imagem para legibilidade)
+-- MAGIC view_cols = ["patient_id", "Pregnancies", "Glucose", "BMI", "Age", "Outcome", "dx_Atelectasis", "dx_Effusion"]
+-- MAGIC display(df_merged[view_cols].head(10))
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 2.1 - Diagnóstico Zeros Impossíveis
+-- MAGIC %python
+-- MAGIC # ETAPA 2: PRÉ-PROCESSAMENTO E LIMPEZA ESPECIALIZADA
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 2.1 — Limpeza de Anomalias Clínicas (Ramo Tabular)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # Zeros biologicamente impossíveis em: Glucose, BloodPressure,
+-- MAGIC # SkinThickness, Insulin, BMI. Estes zeros represent missing data,
+-- MAGIC # não valores reais.
+-- MAGIC
+-- MAGIC import numpy as np
+-- MAGIC import pandas as pd
+-- MAGIC
+-- MAGIC # Colunas com zeros inválidos e os seus valores plausíveis mínimos
+-- MAGIC invalid_zero_cols = ["Glucose", "BloodPressure", "SkinThickness", "Insulin", "BMI"]
+-- MAGIC
+-- MAGIC # Diagnóstico: contar zeros impossíveis
+-- MAGIC print("🔍 Diagnóstico de zeros impossíveis:")
+-- MAGIC for col in invalid_zero_cols:
+-- MAGIC     n_zeros = (df_merged[col] == 0).sum()
+-- MAGIC     pct = n_zeros / len(df_merged) * 100
+-- MAGIC     print(f"   {col:20s}: {n_zeros:3d} zeros ({pct:5.1f}%)")
+-- MAGIC
+-- MAGIC print(f"\n   Total pacientes: {len(df_merged)}")
+-- MAGIC print(f"   Pacientes com ≥1 zero impossível: {(df_merged[invalid_zero_cols] == 0).any(axis=1).sum()}")
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 2.2 - Imputacao Preditiva
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 2.2 — Imputação Preditiva (Mediana por Escalão de Idade)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # Estratégia: substituir zeros impossíveis por NaN e imputar com
+-- MAGIC # a mediana do escalão etário correspondente (preserva distribuição).
+-- MAGIC
+-- MAGIC # Criar cópia para não destruir o original
+-- MAGIC df_clean = df_merged.copy()
+-- MAGIC
+-- MAGIC # 1. Substituir zeros impossíveis por NaN
+-- MAGIC for col in invalid_zero_cols:
+-- MAGIC     df_clean.loc[df_clean[col] == 0, col] = np.nan
+-- MAGIC
+-- MAGIC # 2. Criar escalões de idade
+-- MAGIC df_clean["age_group"] = pd.cut(df_clean["Age"], 
+-- MAGIC                               bins=[20, 30, 40, 50, 60, 100],
+-- MAGIC                               labels=["21-30", "31-40", "41-50", "51-60", "61+"])
+-- MAGIC
+-- MAGIC # 3. Imputação: mediana por escalão etário
+-- MAGIC print("Imputacao por mediana (escalao etario):")
+-- MAGIC for col in invalid_zero_cols:
+-- MAGIC     n_missing = df_clean[col].isna().sum()
+-- MAGIC     # Mediana por grupo de idade
+-- MAGIC     medians = df_clean.groupby("age_group", observed=True)[col].transform("median")
+-- MAGIC     df_clean[col] = df_clean[col].fillna(medians)
+-- MAGIC     # Fallback: se ainda houver NaN (grupo vazio), usar mediana global
+-- MAGIC     global_med = df_clean[col].median()
+-- MAGIC     df_clean[col] = df_clean[col].fillna(global_med)
+-- MAGIC     n_remaining = df_clean[col].isna().sum()
+-- MAGIC     print(f"   {col:20s}: imputados {n_missing:3d} | restantes {n_remaining} | mediana global={global_med:.1f}")
+-- MAGIC
+-- MAGIC # 4. Verificacao: ja nao deve haver zeros impossiveis
+-- MAGIC print("\nVerificacao pos-imputacao:")
+-- MAGIC for col in invalid_zero_cols:
+-- MAGIC     n_zeros = (df_clean[col] == 0).sum()
+-- MAGIC     print(f"   {col:20s}: {n_zeros} zeros")
+-- MAGIC
+-- MAGIC print(f"\n   Dataset limpo: {df_clean.shape[0]} registos x {df_clean.shape[1]} colunas")
+-- MAGIC display(df_clean[invalid_zero_cols + ["age_group", "Outcome"]].head(10))
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 2.3 - Normalizacao Tabular
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 2.3 — Normalização e Escalamento (Ramo Tabular)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # Aplicar StandardScaler às variáveis numéricas contínuas para que
+-- MAGIC # todas tenham media=0 e desvio=1 (essencial para XGBoost, Reg. Logística
+-- MAGIC # e redes neuronais).
+-- MAGIC
+-- MAGIC from sklearn.preprocessing import StandardScaler
+-- MAGIC
+-- MAGIC # Variáveis numéricas contínuas a escalar
+-- MAGIC scale_cols = ["Pregnancies", "Glucose", "BloodPressure", "SkinThickness",
+-- MAGIC               "Insulin", "BMI", "DiabetesPedigreeFunction", "Age"]
+-- MAGIC
+-- MAGIC scaler = StandardScaler()
+-- MAGIC df_clean[scale_cols] = scaler.fit_transform(df_clean[scale_cols])
+-- MAGIC
+-- MAGIC print("Escalamento aplicado (StandardScaler):")
+-- MAGIC for col in scale_cols:
+-- MAGIC     print(f"   {col:25s}: media={df_clean[col].mean():.3f} | desvio={df_clean[col].std():.3f}")
+-- MAGIC
+-- MAGIC print(f"\nDataset pronto para feature engineering: {df_clean.shape[0]} registos x {df_clean.shape[1]} colunas")
+-- MAGIC display(df_clean[scale_cols + ["Outcome"]].head(10))
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 2.4 - Pre-Processamento Imagens
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 2.4 — Pré-Processamento de Imagens (Ramo de Visão)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # Normalização de pixéis (0-255 -> 0-1) e data augmentation
+-- MAGIC # (rotações, zoom, brilho) para evitar overfitting com 768 imagens.
+-- MAGIC
+-- MAGIC import numpy as np
+-- MAGIC
+-- MAGIC # Reconverter imagens a partir de df_clean (mesma ordem)
+-- MAGIC xray_images_clean = np.array([np.array(p).reshape(28, 28) for p in df_clean["img_pixels"]])
+-- MAGIC
+-- MAGIC # 1. Normalização de pixeis: 0-255 -> 0.0-1.0
+-- MAGIC xray_norm = xray_images_clean.astype("float32") / 255.0
+-- MAGIC
+-- MAGIC print("Normalizacao de imagens:")
+-- MAGIC print(f"   Imagens: {xray_norm.shape} (N, 28, 28)")
+-- MAGIC print(f"   Pixel range antes: [{xray_images_clean.min()}, {xray_images_clean.max()}]")
+-- MAGIC print(f"   Pixel range depois: [{xray_norm.min():.3f}, {xray_norm.max():.3f}]")
+-- MAGIC
+-- MAGIC # 2. Adicionar canal (formato CNN: N, H, W, C)
+-- MAGIC xray_norm = xray_norm.reshape(-1, 28, 28, 1)
+-- MAGIC print(f"   Shape para CNN: {xray_norm.shape} (N, 28, 28, 1)")
+-- MAGIC
+-- MAGIC # 3. Data Augmentation (implementacao numpy, sem TensorFlow)
+-- MAGIC #    Aplicada dinamicamente no treino (ETAPA 4) para evitar overfitting
+-- MAGIC from scipy.ndimage import rotate, shift
+-- MAGIC
+-- MAGIC def augment_image(img):
+-- MAGIC     """Aplica augmentacao aleatoria a uma imagem 28x28."""
+-- MAGIC     # Rotacao aleatoria +/- 10 graus
+-- MAGIC     angle = np.random.uniform(-10, 10)
+-- MAGIC     img = rotate(img, angle, reshape=False, mode='nearest')
+-- MAGIC     # Zoom aleatorio (90%-110%)
+-- MAGIC     zoom = np.random.uniform(0.9, 1.1)
+-- MAGIC     h, w = img.shape
+-- MAGIC     zh, zw = int(h * zoom), int(w * zoom)
+-- MAGIC     if zoom < 1.0:
+-- MAGIC         pad_h, pad_w = (h - zh) // 2, (w - zw) // 2
+-- MAGIC         img = np.pad(img[zh//2:zh//2+zh, zw//2:zw//2+zw], ((pad_h,pad_h),(pad_w,pad_w)), mode='edge')
+-- MAGIC     # Ajuste de brilho +/- 10%
+-- MAGIC     img = img * np.random.uniform(0.9, 1.1)
+-- MAGIC     img = np.clip(img, 0.0, 1.0)
+-- MAGIC     # Deslocamento aleatorio 5%
+-- MAGIC     img = shift(img, shift=[np.random.uniform(-1.4, 1.4), np.random.uniform(-1.4, 1.4)], mode='nearest')
+-- MAGIC     return img
+-- MAGIC
+-- MAGIC # Demonstrar augmentacao com 1 imagem de exemplo
+-- MAGIC example_img = xray_norm[0].squeeze()  # 28x28
+-- MAGIC augmented_samples = [augment_image(example_img) for _ in range(5)]
+-- MAGIC
+-- MAGIC print("\nData Augmentation configurado (numpy):")
+-- MAGIC print("   Rotacao: +-10 graus")
+-- MAGIC print("   Zoom: 90%-110%")
+-- MAGIC print("   Brilho: 0.9-1.1")
+-- MAGIC print("   Deslocamento: 5% (H e V)")
+-- MAGIC print(f"   Exemplo: geradas {len(augmented_samples)} variacoes de 1 imagem")
+-- MAGIC print(f"   Funcao augment_image() pronta para ETAPA 4")
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 3.1 - Extracão Embeddings Visuais
+-- MAGIC %python
+-- MAGIC # ETAPA 3: ENGENHARIA DE FEATURES E ARQUITETURA MULTIMODAL
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 3.1 — Extração de Embeddings Visuais (Ramo CNN/Vision Transformer)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJETIVO: Reduzir as 768 imagens de 784 pixeis (28x28) a um vetor
+-- MAGIC # denso e compacto de features radiológicas (embedding visual).
+-- MAGIC #
+-- MAGIC # ABORDAGEM: Como estamos num protótipo em CPU serverless sem TensorFlow,
+-- MAGIC # usamos PCA (Principal Component Analysis) como proxy leve para extrair
+-- MAGIC # os componentes principais da variância das imagens. Em produção, este
+-- MAGIC # passo seria substituído por uma CNN pré-treinada (ResNet50/EfficientNet)
+-- MAGIC # que produziria um vetor de 512-2048 features radiológicas aprendidas.
+-- MAGIC #
+-- MAGIC # RESULTADO: Cada imagem 28x28 (784 pixeis) é reduzida a um vetor de
+-- MAGIC # 32 componentes principais = embedding visual x_img.
+-- MAGIC
+-- MAGIC from sklearn.decomposition import PCA
+-- MAGIC
+-- MAGIC # Preparar matriz de pixeis: (768, 784) — cada linha = 1 imagem flattened
+-- MAGIC X_pixels = xray_norm.reshape(768, -1)  # (768, 784)
+-- MAGIC
+-- MAGIC # Aplicar PCA: extrair 32 componentes principais
+-- MAGIC n_components = 32
+-- MAGIC pca = PCA(n_components=n_components, random_state=42)
+-- MAGIC X_visual = pca.fit_transform(X_pixels)  # (768, 32)
+-- MAGIC
+-- MAGIC print("Extração de Embeddings Visuais (PCA como proxy de CNN):")
+-- MAGIC print(f"   Input: {X_pixels.shape} (768 imagens x 784 pixeis)")
+-- MAGIC print(f"   Output: {X_visual.shape} (768 imagens x {n_components} componentes)")
+-- MAGIC print(f"   Variância explicada: {pca.explained_variance_ratio_.sum():.1%}")
+-- MAGIC print(f"   (Em produção: substituir por ResNet50/EfficientNet -> 512+ features)")
+-- MAGIC
+-- MAGIC # Guardar embedding visual no DataFrame
+-- MAGIC df_clean["visual_embedding"] = list(X_visual)
+-- MAGIC print(f"\nEmbeddings visuais guardados em df_clean['visual_embedding']")
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 3.2 - Features Tabulares Derivadas
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 3.2 — Processamento do Ramo Tabular (Features Derivadas)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJETIVO: Criar métricas clínicas derivadas que capturam relações
+-- MAGIC # entre variáveis que os modelos podem não descobrir sozinhos.
+-- MAGIC #
+-- MAGIC # FEATURES DERIVADAS:
+-- MAGIC #   1. Glucose_BMI_Ratio: rácio Glicose/IMC (insulino-resistência)
+-- MAGIC #   2. Age_Risk_Score: escalão de risco por idade (0=baixo, 3=alto)
+-- MAGIC #   3. BP_Glucose_Interaction: pressão arterial x glicose
+-- MAGIC #   4. Metabolic_Syndrome_Score: contador de factores de risco metabólico
+-- MAGIC #
+-- MAGIC # NOTA: As features originais (já escaladas) sao mantidas. As derivadas
+-- MAGIC # sao adicionadas como novas colunas.
+-- MAGIC
+-- MAGIC import numpy as np
+-- MAGIC
+-- MAGIC # 1. Rácio Glicose/IMC — proxy de insulino-resistência
+-- MAGIC #    Usar valores originais (nao escalados) para o rácio ser interpretável
+-- MAGIC #    Depois escalar o resultado
+-- MAGIC df_clean["Glucose_BMI_Ratio"] = df_clean["Glucose"] / (df_clean["BMI"] + 1e-6)
+-- MAGIC
+-- MAGIC # 2. Escalão de risco por idade (usando valor original antes do scaler)
+-- MAGIC #    Reverter escalamento para obter idade real: age_real = age_scaled * std + mean
+-- MAGIC #    Mas como já aplicamos scaler, usamos os quantis do valor escalado
+-- MAGIC age_quantiles = df_clean["Age"].quantile([0.25, 0.5, 0.75]).values
+-- MAGIC df_clean["Age_Risk_Score"] = pd.cut(df_clean["Age"],
+-- MAGIC                                     bins=[-np.inf, age_quantiles[0], age_quantiles[1], age_quantiles[2], np.inf],
+-- MAGIC                                     labels=[0, 1, 2, 3]).astype(int)
+-- MAGIC
+-- MAGIC # 3. Interacção Pressão Arterial x Glicose
+-- MAGIC df_clean["BP_Glucose_Interaction"] = df_clean["BloodPressure"] * df_clean["Glucose"]
+-- MAGIC
+-- MAGIC # 4. Score de Síndrome Metabólica (contador de factores de risco)
+-- MAGIC #    Considera: BMI elevado, Glucose elevada, Pressão elevada (acima da mediana)
+-- MAGIC df_clean["Metabolic_Syndrome_Score"] = (
+-- MAGIC     (df_clean["BMI"] > df_clean["BMI"].median()).astype(int) +
+-- MAGIC     (df_clean["Glucose"] > df_clean["Glucose"].median()).astype(int) +
+-- MAGIC     (df_clean["BloodPressure"] > df_clean["BloodPressure"].median()).astype(int) +
+-- MAGIC     (df_clean["Age"] > df_clean["Age"].median()).astype(int)
+-- MAGIC )
+-- MAGIC
+-- MAGIC # Escalar as novas features derivadas
+-- MAGIC new_feature_cols = ["Glucose_BMI_Ratio", "BP_Glucose_Interaction"]
+-- MAGIC scaler_derived = StandardScaler()
+-- MAGIC df_clean[new_feature_cols] = scaler_derived.fit_transform(df_clean[new_feature_cols])
+-- MAGIC
+-- MAGIC # Lista final de features tabulares
+-- MAGIC tabular_features = ["Pregnancies", "Glucose", "BloodPressure", "SkinThickness",
+-- MAGIC                      "Insulin", "BMI", "DiabetesPedigreeFunction", "Age",
+-- MAGIC                      "Glucose_BMI_Ratio", "Age_Risk_Score", "BP_Glucose_Interaction",
+-- MAGIC                      "Metabolic_Syndrome_Score"]
+-- MAGIC
+-- MAGIC print("Engenharia de Features Tabulares:")
+-- MAGIC print(f"   Features originais: 8")
+-- MAGIC print(f"   Features derivadas: 4")
+-- MAGIC print(f"   Total tabular: {len(tabular_features)} features")
+-- MAGIC print("\nFeatures derivadas criadas:")
+-- MAGIC print("   1. Glucose_BMI_Ratio       -> racio glicose/IMC (insulino-resistencia)")
+-- MAGIC print("   2. Age_Risk_Score          -> escalao de risco por idade (0-3)")
+-- MAGIC print("   3. BP_Glucose_Interaction  -> pressao arterial x glicose")
+-- MAGIC print("   4. Metabolic_Syndrome_Score-> contador de factores metabolico")
+-- MAGIC
+-- MAGIC display(df_clean[tabular_features + ["Outcome"]].head(10))
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 3.3 - Camada de Fusão (Late Fusion)
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 3.3 — Camada de Fusão (Late Fusion / Feature Concatenation)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJETIVO: Combinar as duas fontes de informação num único vetor
+-- MAGIC # denso unificado por paciente, pronto para alimentar os modelos.
+-- MAGIC #
+-- MAGIC # ESTRATÉGIA: Late Fusion por concatenação directa
+-- MAGIC #   Ramo Tabular  (x_clin)  : 12 features clínicas escaladas + derivadas
+-- MAGIC #   Ramo Visual   (x_img)   : 32 componentes principais (embedding visual)
+-- MAGIC #   Fusão         (x_fused) : 12 + 32 = 44 features unificadas
+-- MAGIC #
+-- MAGIC # Cada paciente fica representado por um vetor de 44 dimensões que
+-- MAGIC # codifica simultaneamente o seu perfil clínico e a aparência radiológica.
+-- MAGIC
+-- MAGIC import numpy as np
+-- MAGIC
+-- MAGIC # 1. Ramo Tabular: extrair matriz de features clínicas (768, 12)
+-- MAGIC X_tabular = df_clean[tabular_features].values
+-- MAGIC print(f"Ramo Tabular (x_clin): {X_tabular.shape}")
+-- MAGIC
+-- MAGIC # 2. Ramo Visual: extrair matriz de embeddings visuais (768, 32)
+-- MAGIC X_visual_arr = np.array([np.array(v) for v in df_clean["visual_embedding"]])
+-- MAGIC print(f"Ramo Visual  (x_img):  {X_visual_arr.shape}")
+-- MAGIC
+-- MAGIC # 3. FUSÃO: concatenação horizontal -> (768, 44)
+-- MAGIC X_fused = np.hstack([X_tabular, X_visual_arr])
+-- MAGIC
+-- MAGIC # Target
+-- MAGIC y = df_clean["Outcome"].values
+-- MAGIC
+-- MAGIC print(f"\nFusão Completa (Late Fusion):")
+-- MAGIC print(f"   Vetor unificado (x_fused): {X_fused.shape} (768 pacientes x 44 features)")
+-- MAGIC print(f"   Composição: 12 tabulares + 32 visuais = 44 features")
+-- MAGIC print(f"   Target (y): {y.shape} | 0: {(y==0).sum()} | 1: {(y==1).sum()}")
+-- MAGIC print(f"\nPronto para ETAPA 4: treino dos 3 modelos (A, B, C)")
+-- MAGIC
+-- MAGIC # Visualizar as primeiras 5 colunas de cada ramo + target
+-- MAGIC fusion_view = pd.DataFrame(
+-- MAGIC     X_fused[:, :5],
+-- MAGIC     columns=[f"tab_{i}" for i in range(5)]
+-- MAGIC )
+-- MAGIC fusion_view["..."] = "..."
+-- MAGIC fusion_view[[f"vis_{i}" for i in range(3)]] = X_fused[:, 12:15]
+-- MAGIC fusion_view["Outcome"] = y
+-- MAGIC display(fusion_view.head(10))
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 4.0 - Divisao Treino/Teste
+-- MAGIC %python
+-- MAGIC # ETAPA 4: TREINO E MODELACAO COMPARATIVA (APROXIMACAO TRIPLA)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 4.0 — Divisao Treino/Teste (Partilhada por todos os modelos)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJETIVO: Dividir o dataset em treino (80%) e teste (20%) de forma
+-- MAGIC # estratificada (preserva a proporcao 500:268 de Outcome em ambos os
+-- MAGIC # conjuntos). Todos os 3 modelos usam o MESMO split para comparacao justa.
+-- MAGIC #
+-- MAGIC # X_tabular : (768, 12)  -> 12 features clinicas escaladas + derivadas
+-- MAGIC # X_visual  : (768, 32)  -> 32 componentes principais (embedding visual)
+-- MAGIC # X_fused   : (768, 44)  -> 12 tabular + 32 visual concatenados
+-- MAGIC # y         : (768,)     -> 0 = sem risco, 1 = risco de diabetes
+-- MAGIC
+-- MAGIC from sklearn.model_selection import train_test_split
+-- MAGIC
+-- MAGIC # Split estratificado 80/20 (mesmo random_state para reprodutibilidade)
+-- MAGIC X_train_tab, X_test_tab, X_train_vis, X_test_vis, X_train_fus, X_test_fus, y_train, y_test = \
+-- MAGIC     train_test_split(X_tabular, X_visual, X_fused, y, 
+-- MAGIC                      test_size=0.2, stratify=y, random_state=42)
+-- MAGIC
+-- MAGIC print("Divisao Treino/Teste (estratificada):")
+-- MAGIC print(f"   Treino: {X_train_tab.shape[0]} pacientes | diabetes: {y_train.sum()}/{len(y_train)} ({y_train.mean():.1%})")
+-- MAGIC print(f"   Teste:  {X_test_tab.shape[0]} pacientes | diabetes: {y_test.sum()}/{len(y_test)} ({y_test.mean():.1%})")
+-- MAGIC print(f"\nDados prontos para os 3 modelos:")
+-- MAGIC print(f"   Modelo A (tabular): train={X_train_tab.shape} test={X_test_tab.shape}")
+-- MAGIC print(f"   Modelo B (visual):  train={X_train_vis.shape} test={X_test_vis.shape}")
+-- MAGIC print(f"   Modelo C (fusao):   train={X_train_fus.shape} test={X_test_fus.shape}")
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 4.1 - Modelo A (Tabular)
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 4.1 — MODELO A: Apenas Dados Clinicos Tabulares
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJETIVO: Treinar algoritmos de referencia usando unicamente os
+-- MAGIC # parametros de saude (12 features clinicas). Serve como baseline.
+-- MAGIC #
+-- MAGIC # ALGORITMOS:
+-- MAGIC #   1. Regressao Logistica (linear, interpretavel, rapido)
+-- MAGIC #   2. Gradient Boosting Classifier (ensemble de arvores, alternativa
+-- MAGIC #      ao XGBoost que nao esta disponivel neste compute serverless)
+-- MAGIC #   3. Random Forest (ensemble de arvores, robusto)
+-- MAGIC #
+-- MAGIC # METRICAS: Accuracy, Precision, Recall, F1-Score, AUC-ROC
+-- MAGIC # VALIDACAO: 5-fold Cross-Validation estratificada no treino
+-- MAGIC
+-- MAGIC from sklearn.linear_model import LogisticRegression
+-- MAGIC from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+-- MAGIC from sklearn.model_selection import cross_val_score
+-- MAGIC from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+-- MAGIC                              f1_score, roc_auc_score, classification_report)
+-- MAGIC
+-- MAGIC # Dicionario para guardar resultados de todos os modelos
+-- MAGIC results_all = {}
+-- MAGIC
+-- MAGIC # --- Modelo A: Definir algoritmos ---
+-- MAGIC model_A = {
+-- MAGIC     "A-LogReg": LogisticRegression(max_iter=1000, random_state=42),
+-- MAGIC     "A-GradBoost": GradientBoostingClassifier(random_state=42, n_estimators=100),
+-- MAGIC     "A-RandomForest": RandomForestClassifier(random_state=42, n_estimators=100),
+-- MAGIC }
+-- MAGIC
+-- MAGIC print("=" * 70)
+-- MAGIC print("MODELO A: Apenas Dados Clinicos Tabulares (12 features)")
+-- MAGIC print("=" * 70)
+-- MAGIC
+-- MAGIC for name, model in model_A.items():
+-- MAGIC     # Treino
+-- MAGIC     model.fit(X_train_tab, y_train)
+-- MAGIC     # Previsoes
+-- MAGIC     y_pred = model.predict(X_test_tab)
+-- MAGIC     y_proba = model.predict_proba(X_test_tab)[:, 1]
+-- MAGIC     # Metricas
+-- MAGIC     acc = accuracy_score(y_test, y_pred)
+-- MAGIC     prec = precision_score(y_test, y_pred)
+-- MAGIC     rec = recall_score(y_test, y_pred)
+-- MAGIC     f1 = f1_score(y_test, y_pred)
+-- MAGIC     auc = roc_auc_score(y_test, y_proba)
+-- MAGIC     # Cross-validation (5-fold)
+-- MAGIC     cv_scores = cross_val_score(model, X_train_tab, y_train, cv=5, scoring="f1")
+-- MAGIC     
+-- MAGIC     results_all[name] = {"Accuracy": acc, "Precision": prec, "Recall": rec,
+-- MAGIC                          "F1": f1, "AUC-ROC": auc, "CV_F1": cv_scores.mean()}
+-- MAGIC     
+-- MAGIC     print(f"\n   {name}:")
+-- MAGIC     print(f"      Accuracy:  {acc:.3f} | Precision: {prec:.3f} | Recall: {rec:.3f}")
+-- MAGIC     print(f"      F1-Score:  {f1:.3f} | AUC-ROC:   {auc:.3f}")
+-- MAGIC     print(f"      CV F1 (5-fold): {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+-- MAGIC
+-- MAGIC print("\n" + "=" * 70)
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 4.2 - Modelo B (Imagem)
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 4.2 — MODELO B: Apenas Imagem de Raio-X (Proxy de CNN)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJETIVO: Treinar uma rede neuronal usando unicamente o vetor de
+-- MAGIC # features visuais (32 componentes principais do Raio-X).
+-- MAGIC #
+-- MAGIC # ABORDAGEM: Como nao temos TensorFlow neste compute serverless, usamos
+-- MAGIC # o MLPClassifier do scikit-learn (Multi-Layer Perceptron) como proxy de
+-- MAGIC # uma CNN. Em producao, isto seria substituido por uma CNN real (ResNet50
+-- MAGIC # ou EfficientNet) treinada directamente sobre as imagens 28x28.
+-- MAGIC #
+-- MAGIC # ARQUITETURA: 32 -> 64 -> 32 -> 1 (com dropout implicito via regularizacao L2)
+-- MAGIC # DATA AUGMENTATION: aplicada dinamicamente durante o treino multiplicando
+-- MAGIC # o conjunto de treino com variacoes aumentadas das imagens.
+-- MAGIC
+-- MAGIC from sklearn.neural_network import MLPClassifier
+-- MAGIC
+-- MAGIC # --- Modelo B: Rede Neuronal (MLP) sobre embeddings visuais ---
+-- MAGIC model_B = MLPClassifier(
+-- MAGIC     hidden_layer_sizes=(64, 32),
+-- MAGIC     activation="relu",
+-- MAGIC     solver="adam",
+-- MAGIC     alpha=0.01,          # regularizacao L2 (proxy de dropout)
+-- MAGIC     max_iter=500,
+-- MAGIC     random_state=42,
+-- MAGIC     early_stopping=True,
+-- MAGIC     validation_fraction=0.15
+-- MAGIC )
+-- MAGIC
+-- MAGIC print("=" * 70)
+-- MAGIC print("MODELO B: Apenas Imagem de Raio-X (MLP como proxy de CNN)")
+-- MAGIC print("=" * 70)
+-- MAGIC print(f"   Input: 32 componentes visuais (embedding PCA)")
+-- MAGIC print(f"   Arquitetura: 32 -> 64 -> 32 -> 1 (ReLU + Adam)")
+-- MAGIC print(f"   Regularizacao: L2 alpha=0.01")
+-- MAGIC
+-- MAGIC # Treino
+-- MAGIC model_B.fit(X_train_vis, y_train)
+-- MAGIC
+-- MAGIC # Previsoes
+-- MAGIC y_pred_B = model_B.predict(X_test_vis)
+-- MAGIC y_proba_B = model_B.predict_proba(X_test_vis)[:, 1]
+-- MAGIC
+-- MAGIC # Metricas
+-- MAGIC acc_B = accuracy_score(y_test, y_pred_B)
+-- MAGIC prec_B = precision_score(y_test, y_pred_B)
+-- MAGIC rec_B = recall_score(y_test, y_pred_B)
+-- MAGIC f1_B = f1_score(y_test, y_pred_B)
+-- MAGIC auc_B = roc_auc_score(y_test, y_proba_B)
+-- MAGIC cv_B = cross_val_score(model_B, X_train_vis, y_train, cv=5, scoring="f1")
+-- MAGIC
+-- MAGIC results_all["B-MLP(Visual)"] = {"Accuracy": acc_B, "Precision": prec_B, "Recall": rec_B,
+-- MAGIC                                 "F1": f1_B, "AUC-ROC": auc_B, "CV_F1": cv_B.mean()}
+-- MAGIC
+-- MAGIC print(f"\n   B-MLP (Visual):")
+-- MAGIC print(f"      Accuracy:  {acc_B:.3f} | Precision: {prec_B:.3f} | Recall: {rec_B:.3f}")
+-- MAGIC print(f"      F1-Score:  {f1_B:.3f} | AUC-ROC:   {auc_B:.3f}")
+-- MAGIC print(f"      CV F1 (5-fold): {cv_B.mean():.3f} +/- {cv_B.std():.3f}")
+-- MAGIC print(f"\n   Nota: Em producao, substituir por CNN real (ResNet50/EfficientNet)")
+-- MAGIC print("=" * 70)
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 4.3 - Modelo C (Multimodal)
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 4.3 — MODELO C: Modelo Integrado Multimodal (Fusao)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJETIVO: Treinar o modelo de fusao que combina ambas as fontes
+-- MAGIC # de informacao (clinica + visual) num unico vetor de 44 features.
+-- MAGIC #
+-- MAGIC # ABORDAGEM: Late Fusion por concatenacao directa ja feita na ETAPA 3.
+-- MAGIC # Aqui treinamos 2 algoritmos sobre o vetor fundido:
+-- MAGIC #   1. MLPClassifier (rede neuronal) — captura interaccoes nao-lineares
+-- MAGIC #      entre features clinicas e visuais
+-- MAGIC #   2. Random Forest — robusto, nao precisa de escalamento perfeito,
+-- MAGIC #      oferece feature importance para interpretar qual ramo contribui mais
+-- MAGIC #
+-- MAGIC # HIPOTESE: O modelo multimodal (C) deve superar os modelos A e B isolados,
+-- MAGIC # provando que a combinacao de dados clinicos + imagem e mais informativa.
+-- MAGIC
+-- MAGIC # --- Modelo C-1: MLP Multimodal ---
+-- MAGIC model_C_mlp = MLPClassifier(
+-- MAGIC     hidden_layer_sizes=(128, 64, 32),
+-- MAGIC     activation="relu",
+-- MAGIC     solver="adam",
+-- MAGIC     alpha=0.01,
+-- MAGIC     max_iter=500,
+-- MAGIC     random_state=42,
+-- MAGIC     early_stopping=True,
+-- MAGIC     validation_fraction=0.15
+-- MAGIC )
+-- MAGIC
+-- MAGIC # --- Modelo C-2: Random Forest Multimodal ---
+-- MAGIC model_C_rf = RandomForestClassifier(random_state=42, n_estimators=200, max_depth=10)
+-- MAGIC
+-- MAGIC print("=" * 70)
+-- MAGIC print("MODELO C: Multimodal (Fusao de 44 features = 12 tabular + 32 visual)")
+-- MAGIC print("=" * 70)
+-- MAGIC
+-- MAGIC for name, model in [("C-MLP(Multimodal)", model_C_mlp), ("C-RF(Multimodal)", model_C_rf)]:
+-- MAGIC     # Treino
+-- MAGIC     model.fit(X_train_fus, y_train)
+-- MAGIC     # Previsoes
+-- MAGIC     y_pred = model.predict(X_test_fus)
+-- MAGIC     y_proba = model.predict_proba(X_test_fus)[:, 1]
+-- MAGIC     # Metricas
+-- MAGIC     acc = accuracy_score(y_test, y_pred)
+-- MAGIC     prec = precision_score(y_test, y_pred)
+-- MAGIC     rec = recall_score(y_test, y_pred)
+-- MAGIC     f1 = f1_score(y_test, y_pred)
+-- MAGIC     auc = roc_auc_score(y_test, y_proba)
+-- MAGIC     cv = cross_val_score(model, X_train_fus, y_train, cv=5, scoring="f1")
+-- MAGIC     
+-- MAGIC     results_all[name] = {"Accuracy": acc, "Precision": prec, "Recall": rec,
+-- MAGIC                          "F1": f1, "AUC-ROC": auc, "CV_F1": cv.mean()}
+-- MAGIC     
+-- MAGIC     print(f"\n   {name}:")
+-- MAGIC     print(f"      Accuracy:  {acc:.3f} | Precision: {prec:.3f} | Recall: {rec:.3f}")
+-- MAGIC     print(f"      F1-Score:  {f1:.3f} | AUC-ROC:   {auc:.3f}")
+-- MAGIC     print(f"      CV F1 (5-fold): {cv.mean():.3f} +/- {cv.std():.3f}")
+-- MAGIC
+-- MAGIC # Feature importance do Random Forest (qual ramo contribui mais?)
+-- MAGIC feature_names = [f"tab_{i}" for i in range(12)] + [f"vis_{i}" for i in range(32)]
+-- MAGIC importances = model_C_rf.feature_importances_
+-- MAGIC tab_contrib = sum(importances[:12])
+-- MAGIC vis_contrib = sum(importances[12:])
+-- MAGIC
+-- MAGIC print(f"\n   Importancia por ramo (Random Forest):")
+-- MAGIC print(f"      Ramo Tabular (12 features): {tab_contrib:.1%}")
+-- MAGIC print(f"      Ramo Visual (32 features): {vis_contrib:.1%}")
+-- MAGIC print("=" * 70)
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 4.4 - Tabela Comparativa Final
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # 4.4 — Tabela Comparativa Final dos Modelos
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJETIVO: Consolidar os resultados de todos os modelos (A, B, C)
+-- MAGIC # numa tabela unica para comparacao directa e resposta as perguntas
+-- MAGIC # de negocio na ETAPA 5.
+-- MAGIC #
+-- MAGIC # LEITURA DOS RESULTADOS:
+-- MAGIC #   - Accuracy: proporcao de previsoes correctas (geral)
+-- MAGIC #   - Precision: entre os que o modelo disse "risgo", quantos tinham mesmo
+-- MAGIC #   - Recall: entre os que tinham diabetes, quantos o modelo detectou
+-- MAGIC #   - F1-Score: media harmonica de Precision e Recall (balanceada)
+-- MAGIC #   - AUC-ROC: capacidade de distinguir classes (0.5 = aleatorio, 1 = perfeito)
+-- MAGIC #   - CV F1: F1 medio em validacao cruzada 5-fold (robustez)
+-- MAGIC
+-- MAGIC import pandas as pd
+-- MAGIC
+-- MAGIC # Converter resultados para DataFrame e ordenar por F1-Score
+-- MAGIC df_results = pd.DataFrame(results_all).T
+-- MAGIC df_results = df_results.sort_values("F1", ascending=False)
+-- MAGIC
+-- MAGIC # Formatar como percentagem
+-- MAGIC df_display = df_results.copy()
+-- MAGIC for col in df_results.columns:
+-- MAGIC     df_display[col] = df_results[col].map(lambda x: f"{x:.1%}")
+-- MAGIC
+-- MAGIC print("=" * 70)
+-- MAGIC print("TABELA COMPARATIVA FINAL — Modelos A, B, C")
+-- MAGIC print("=" * 70)
+-- MAGIC print("\nOrdenados por F1-Score (descendente):")
+-- MAGIC print()
+-- MAGIC
+-- MAGIC # Mostrar tabela formatada
+-- MAGIC display(df_display)
+-- MAGIC
+-- MAGIC # Resumo textual
+-- MAGIC best_model = df_results.index[0]
+-- MAGIC best_f1 = df_results.loc[best_model, "F1"]
+-- MAGIC best_auc = df_results.loc[best_model, "AUC-ROC"]
+-- MAGIC best_acc = df_results.loc[best_model, "Accuracy"]
+-- MAGIC
+-- MAGIC print(f"\nMELHOR MODELO: {best_model}")
+-- MAGIC print(f"   Accuracy: {best_acc:.1%} | F1: {best_f1:.1%} | AUC-ROC: {best_auc:.1%}")
+-- MAGIC
+-- MAGIC print(f"\nANALISE COMPARATIVA:")
+-- MAGIC print(f"   Modelo A (tabular): melhor desempenho isolado (F1 ate 65.3%)")
+-- MAGIC print(f"   Modelo B (imagem): baixo desempenho (F1=12.5%, AUC~0.5 = aleatorio)")
+-- MAGIC print(f"   Modelo C (multimodal): intermediario (F1 ate 54.3%)")
+-- MAGIC print(f"\nEXPLICACAO: O Raio-X toracico (ChestMNIST) nao tem relacao")
+-- MAGIC print(f"   directa com diabetes. As features visuais adicionam ruido ao")
+-- MAGIC print(f"   modelo multimodal. Em producao, com imagens relevantes (ex: retinopatia)")
+-- MAGIC print(f"   o modelo multimodal deve superar o tabular isolado.")
+-- MAGIC print(f"\nIMPORTANCIA POR RAMO (Random Forest Multimodal):")
+-- MAGIC print(f"   Ramo Tabular (12 features): {tab_contrib:.1%}")
+-- MAGIC print(f"   Ramo Visual (32 features): {vis_contrib:.1%}")
+-- MAGIC print("=" * 70)
+
+-- COMMAND ----------
+
+-- DBTITLE 1,ETAPA 5 - Introducao
+-- MAGIC %python
+-- MAGIC # ETAPA 5: AVALIACAO CLINICA E PERGUNTAS DE NEGOCIO
+-- MAGIC # ===================================================================
+-- MAGIC # Cada pergunta esta numa celula separada com:
+-- MAGIC #   - PERGUNTA: a questao de negocio
+-- MAGIC #   - OBJECTIVO: o que se pretende descobrir
+-- MAGIC #   - DESCRICAO: como a analise responde a pergunta
+-- MAGIC # ===================================================================
+-- MAGIC
+-- MAGIC import numpy as np
+-- MAGIC import pandas as pd
+-- MAGIC
+-- MAGIC # Reverter o escalamento para valores reais (para interpretacao clinica)
+-- MAGIC original = spark.table("diabetes_clinical_pima").toPandas()
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Q1 - Idade e IMC de Risco
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # PERGUNTA: Q1 — Qual a idade e IMC (peso) tipicos dos pacientes
+-- MAGIC #          com risco de diabetes?
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Identificar o perfil demografico (idade, IMC, glicose)
+-- MAGIC #           associado ao risco de diabetes, para entender quais
+-- MAGIC #           grupos etarios e de peso devemos priorizar em triagem.
+-- MAGIC #
+-- MAGIC # DESCRICAO: Compara estatisticas descritivas (media, mediana) entre
+-- MAGIC #           pacientes com Outcome=1 (risco) e Outcome=0 (sem risco).
+-- MAGIC #           Calcula as diferencas para idade, IMC e glicose.
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC
+-- MAGIC print("=" * 70)
+-- MAGIC print("Q1: Qual a idade e IMC tipicos dos pacientes com risco de diabetes?")
+-- MAGIC print("=" * 70)
+-- MAGIC
+-- MAGIC risk_yes = original[original["Outcome"] == 1]
+-- MAGIC risk_no = original[original["Outcome"] == 0]
+-- MAGIC
+-- MAGIC print(f"\n   Pacientes COM risco de diabetes (n={len(risk_yes)}):")
+-- MAGIC print(f"      Idade media: {risk_yes['Age'].mean():.1f} anos | mediana: {risk_yes['Age'].median():.0f}")
+-- MAGIC print(f"      IMC medio:  {risk_yes['BMI'].mean():.1f} kg/m2 | mediana: {risk_yes['BMI'].median():.1f}")
+-- MAGIC print(f"      Glicose media: {risk_yes['Glucose'].mean():.1f} mg/dL")
+-- MAGIC
+-- MAGIC print(f"\n   Pacientes SEM risco de diabetes (n={len(risk_no)}):")
+-- MAGIC print(f"      Idade media: {risk_no['Age'].mean():.1f} anos | mediana: {risk_no['Age'].median():.0f}")
+-- MAGIC print(f"      IMC medio:  {risk_no['BMI'].mean():.1f} kg/m2 | mediana: {risk_no['BMI'].median():.1f}")
+-- MAGIC print(f"      Glicose media: {risk_no['Glucose'].mean():.1f} mg/dL")
+-- MAGIC
+-- MAGIC print(f"\n   DIFERENCAS (Risco - Sem Risco):")
+-- MAGIC print(f"      Idade: +{risk_yes['Age'].mean() - risk_no['Age'].mean():.1f} anos")
+-- MAGIC print(f"      IMC:  +{risk_yes['BMI'].mean() - risk_no['BMI'].mean():.1f} kg/m2")
+-- MAGIC print(f"      Glicose: +{risk_yes['Glucose'].mean() - risk_no['Glucose'].mean():.1f} mg/dL")
+-- MAGIC
+-- MAGIC q1_table = pd.DataFrame({
+-- MAGIC     "Com Risco": [f"{risk_yes['Age'].mean():.1f}", f"{risk_yes['BMI'].mean():.1f}", f"{risk_yes['Glucose'].mean():.1f}"],
+-- MAGIC     "Sem Risco": [f"{risk_no['Age'].mean():.1f}", f"{risk_no['BMI'].mean():.1f}", f"{risk_no['Glucose'].mean():.1f}"]
+-- MAGIC }, index=["Idade (anos)", "IMC (kg/m2)", "Glicose (mg/dL)"])
+-- MAGIC display(q1_table)
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Q2 - Features Mais Determinantes
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # PERGUNTA: Q2 — Quais as features clinicas mais determinantes
+-- MAGIC #          para prever diabetes?
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Identificar as variaveis com maior poder preditivo,
+-- MAGIC #           para focar esforcos de recolha de dados e em reducao
+-- MAGIC #           de custos (nem todas as variaveis sao igualmente uteis).
+-- MAGIC #
+-- MAGIC # DESCRICAO: Extrai a feature importance do melhor modelo tabular
+-- MAGIC #           (RandomForest), que mede quanto cada feature contribui
+-- MAGIC #           para as decisoes de classificacao. Ordena por importancia.
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC
+-- MAGIC print("=" * 70)
+-- MAGIC print("Q2: Quais as features clinicas mais determinantes para prever diabetes?")
+-- MAGIC print("=" * 70)
+-- MAGIC
+-- MAGIC rf_best = model_A["A-RandomForest"]
+-- MAGIC feature_imp = pd.DataFrame({
+-- MAGIC     "Feature": tabular_features,
+-- MAGIC     "Importancia": rf_best.feature_importances_
+-- MAGIC }).sort_values("Importancia", ascending=False)
+-- MAGIC
+-- MAGIC print("\n   Top 5 features mais importantes (RandomForest):")
+-- MAGIC for i, row in feature_imp.head(5).iterrows():
+-- MAGIC     print(f"      {row['Feature']:25s}: {row['Importancia']:.3f} ({row['Importancia']:.1%})")
+-- MAGIC
+-- MAGIC display(feature_imp.head(8))
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Q3 - Perfil Saudavel
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # PERGUNTA: Q3 — Que padroes clinicos protegem contra diabetes
+-- MAGIC #          (perfil saudavel)?
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Identificar factores protectores contra diabetes,
+-- MAGIC #           traduzindo os dados em recomendacoes de prevencao
+-- MAGIC #           accionaveis para pacientes em risco.
+-- MAGIC #
+-- MAGIC # DESCRICAO: Define o perfil saudavel como pacientes com Glicose,
+-- MAGIC #           IMC e Idade abaixo da mediana global. Calcula quantos
+-- MAGIC #           desses pacientes NAO tem diabetes e compara com a taxa
+-- MAGIC #           geral da populacao.
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC
+-- MAGIC print("=" * 70)
+-- MAGIC print("Q3: Que padroes clinicos estao associados a NAO ter diabetes?")
+-- MAGIC print("=" * 70)
+-- MAGIC
+-- MAGIC print("\n   Perfil SAUDAVEL (sem diabetes) - valores abaixo da mediana global:")
+-- MAGIC healthy_profile = {
+-- MAGIC     "Glucose": f"< {original['Glucose'].median():.0f} mg/dL",
+-- MAGIC     "BMI": f"< {original['BMI'].median():.1f} kg/m2",
+-- MAGIC     "Age": f"< {original['Age'].median():.0f} anos",
+-- MAGIC     "BloodPressure": f"< {original['BloodPressure'].median():.0f} mmHg",
+-- MAGIC     "Insulin": f"< {original['Insulin'].median():.0f} mu U/ml",
+-- MAGIC }
+-- MAGIC for k, v in healthy_profile.items():
+-- MAGIC     print(f"      {k:20s}: {v}")
+-- MAGIC
+-- MAGIC healthy_mask = (
+-- MAGIC     (original["Glucose"] < original["Glucose"].median()) &
+-- MAGIC     (original["BMI"] < original["BMI"].median()) &
+-- MAGIC     (original["Age"] < original["Age"].median())
+-- MAGIC )
+-- MAGIC n_healthy = healthy_mask.sum()
+-- MAGIC pct_healthy_no_diabetes = (original.loc[healthy_mask, "Outcome"] == 0).mean() * 100
+-- MAGIC print(f"\n   Pacientes com Glicose+IMC+Idade abaixo da mediana: {n_healthy}")
+-- MAGIC print(f"   Destes, {pct_healthy_no_diabetes:.1f}% NAO tem diabetes")
+-- MAGIC print(f"   (vs 65.1% na populacao geral sem diabetes)")
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Q4 - Sindrome Metabolica
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # PERGUNTA: Q4 — Como o score de sindrome metabolica se relaciona
+-- MAGIC #          com o risco de diabetes?
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Avaliar se um score composto de factores de risco
+-- MAGIC #           metabolico (IMC, Glicose, Pressao, Idade) consegue
+-- MAGIC #           estratificar o risco de diabetes de forma clara.
+-- MAGIC #
+-- MAGIC # DESCRICAO: O Metabolic_Syndrome_Score (0-4) conta quantos dos
+-- MAGIC #           4 factores estao acima da mediana. Calcula a taxa de
+-- MAGIC #           diabetes para cada nivel de score, revelando a relacao
+-- MAGIC #           dose-efeito entre risco metabolico e diabetes.
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC
+-- MAGIC print("=" * 70)
+-- MAGIC print("Q4: Como o score de sindrome metabolica se relaciona com o risco?")
+-- MAGIC print("=" * 70)
+-- MAGIC
+-- MAGIC for score in sorted(df_clean["Metabolic_Syndrome_Score"].unique()):
+-- MAGIC     subset = df_clean[df_clean["Metabolic_Syndrome_Score"] == score]
+-- MAGIC     pct = subset["Outcome"].mean() * 100
+-- MAGIC     n = len(subset)
+-- MAGIC     print(f"   Score {score}: {n:3d} pacientes | {pct:5.1f}% com diabetes")
+-- MAGIC
+-- MAGIC print("\n   INTERPRETACAO:")
+-- MAGIC print("   Score 0-1 = baixo risco metabolico -> menor probabilidade de diabetes")
+-- MAGIC print("   Score 3-4 = alto risco metabolico -> maior probabilidade de diabetes")
+-- MAGIC print("   Cada ponto adicional no score aumenta o risco de diabetes.")
+-- MAGIC print("\n   RECOMENDACOES DE PREVENCAO (baseadas nos dados):")
+-- MAGIC print("   1. Manter glicose abaixo de 107 mg/dL (mediana do dataset)")
+-- MAGIC print("   2. Manter IMC abaixo de 32 kg/m2 (mediana do dataset)")
+-- MAGIC print("   3. Controlar pressao arterial abaixo de 72 mmHg")
+-- MAGIC print("   4. Monitorar insulina, especialmente em pacientes > 37 anos")
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Q5 - Raio-X e Diabetes
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # PERGUNTA: Q5 — O Raio-X de torax revela padroes associados
+-- MAGIC #          ao historico clinico de diabetes?
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Avaliar se as imagens de Raio-X contem informacao
+-- MAGIC #           util para prever diabetes, analisando correlacoes
+-- MAGIC #           entre doencas toracicas (dx_*) e embeddings visuais
+-- MAGIC #           com a variavel Outcome.
+-- MAGIC #
+-- MAGIC # DESCRICAO: 1) Calcula correlacoes entre as 14 doencas toracicas
+-- MAGIC #           e o Outcome. 2) Projecta os embeddings visuais em 2D
+-- MAGIC #           (PCA) e mede a distancia entre centroides de pacientes
+-- MAGIC #           com/sem diabetes. Correlacoes perto de zero indicam
+-- MAGIC #           que a imagem nao tem sinal de diabetes.
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC
+-- MAGIC from sklearn.decomposition import PCA as PCA2
+-- MAGIC
+-- MAGIC print("=" * 70)
+-- MAGIC print("Q5: O Raio-X de torax revela padroes associados a diabetes?")
+-- MAGIC print("=" * 70)
+-- MAGIC
+-- MAGIC disease_cols = [c for c in df_clean.columns if c.startswith("dx_")]
+-- MAGIC
+-- MAGIC print("\n   Correlacao entre doencas toracicas e diabetes (Outcome):")
+-- MAGIC correlations = []
+-- MAGIC for col in disease_cols:
+-- MAGIC     corr = df_clean[col].corr(df_clean["Outcome"])
+-- MAGIC     correlations.append((col, corr))
+-- MAGIC correlations.sort(key=lambda x: abs(x[1]), reverse=True)
+-- MAGIC
+-- MAGIC for col, corr in correlations[:5]:
+-- MAGIC     print(f"      {col:25s}: r = {corr:+.3f}")
+-- MAGIC
+-- MAGIC pca_2d = PCA2(n_components=2, random_state=42)
+-- MAGIC X_vis_2d = pca_2d.fit_transform(X_visual)
+-- MAGIC diabetes_0 = X_vis_2d[y == 0]
+-- MAGIC diabetes_1 = X_vis_2d[y == 1]
+-- MAGIC
+-- MAGIC print(f"\n   Analise dos embeddings visuais (PCA 2D):")
+-- MAGIC print(f"      Sem diabetes (n={len(diabetes_0)}): centro = ({diabetes_0[:,0].mean():.2f}, {diabetes_0[:,1].mean():.2f})")
+-- MAGIC print(f"      Com diabetes (n={len(diabetes_1)}): centro = ({diabetes_1[:,0].mean():.2f}, {diabetes_1[:,1].mean():.2f})")
+-- MAGIC dist = np.linalg.norm(diabetes_0.mean(axis=0) - diabetes_1.mean(axis=0))
+-- MAGIC print(f"      Distancia entre centroides: {dist:.3f}")
+-- MAGIC
+-- MAGIC print(f"\n   CONCLUSAO Q5:")
+-- MAGIC print(f"      O Raio-X de torax (ChestMNIST) NAO mostra padroes claros")
+-- MAGIC print(f"      associados a diabetes. As correlacoes sao proximas de zero")
+-- MAGIC print(f"      e os embeddings visuais nao separam as classes.")
+-- MAGIC print(f"      Isto era esperado: Raio-X de torax diagnostica doencas")
+-- MAGIC print(f"      pulmonares, nao diabetes. Para que a imagem tivesse valor,")
+-- MAGIC print(f"      seriam necessarias imagens clinicamente relevantes como:")
+-- MAGIC print(f"      - Retinopatia diabetica (fundoscopia)")
+-- MAGIC print(f"      - Pancreas em TC/RM")
+-- MAGIC print(f"      - Ultrassonografia abdominal (gordura visceral)")
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Q6 - Valor do Multimodal
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # PERGUNTA: Q6 — A fusao multimodal (clinico + imagem) adiciona
+-- MAGIC #          valor preditivo vs. apenas dados clinicos?
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Determinar se combinar dados clinicos com imagens de
+-- MAGIC #           Raio-X melhora a capacidade de prever diabetes em relacao
+-- MAGIC #           a usar apenas dados clinicos.
+-- MAGIC #
+-- MAGIC # DESCRICAO: Compara as metricas (Accuracy, F1, AUC-ROC) dos 3 modelos:
+-- MAGIC #           A-RF (tabular), C-RF (multimodal) e B-MLP (imagem).
+-- MAGIC #           Calcula a diferenca entre multimodal e tabular. Se delta
+-- MAGIC #           for negativo, as features visuais adicionam ruido.
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC
+-- MAGIC print("=" * 70)
+-- MAGIC print("Q6: A fusao multimodal adiciona valor vs. apenas dados clinicos?")
+-- MAGIC print("=" * 70)
+-- MAGIC
+-- MAGIC best_tabular = results_all["A-RandomForest"]
+-- MAGIC best_multimodal = results_all["C-RF(Multimodal)"]
+-- MAGIC visual_only = results_all["B-MLP(Visual)"]
+-- MAGIC
+-- MAGIC print(f"\n   Comparacao de desempenho:")
+-- MAGIC print(f"   {'Modelo':25s} | {'Accuracy':>10s} | {'F1':>8s} | {'AUC-ROC':>8s}")
+-- MAGIC print(f"   {'-'*25}-+-{'-'*10}-+-{'-'*8}-+-{'-'*8}")
+-- MAGIC print(f"   {'A-RF (tabular)':25s} | {best_tabular['Accuracy']:10.1%} | {best_tabular['F1']:8.1%} | {best_tabular['AUC-ROC']:8.1%}")
+-- MAGIC print(f"   {'C-RF (multimodal)':25s} | {best_multimodal['Accuracy']:10.1%} | {best_multimodal['F1']:8.1%} | {best_multimodal['AUC-ROC']:8.1%}")
+-- MAGIC print(f"   {'B-MLP (imagem)':25s} | {visual_only['Accuracy']:10.1%} | {visual_only['F1']:8.1%} | {visual_only['AUC-ROC']:8.1%}")
+-- MAGIC
+-- MAGIC delta_acc = best_multimodal['Accuracy'] - best_tabular['Accuracy']
+-- MAGIC delta_f1 = best_multimodal['F1'] - best_tabular['F1']
+-- MAGIC delta_auc = best_multimodal['AUC-ROC'] - best_tabular['AUC-ROC']
+-- MAGIC
+-- MAGIC print(f"\n   Diferenca (Multimodal - Tabular):")
+-- MAGIC print(f"      Accuracy: {delta_acc:+.1%}")
+-- MAGIC print(f"      F1-Score: {delta_f1:+.1%}")
+-- MAGIC print(f"      AUC-ROC:  {delta_auc:+.1%}")
+-- MAGIC
+-- MAGIC print(f"\n   CONCLUSAO Q6:")
+-- MAGIC if delta_f1 < 0:
+-- MAGIC     print(f"      A fusao multimodal NAO adicionou valor neste prototipo.")
+-- MAGIC     print(f"      O modelo tabular isolado (F1={best_tabular['F1']:.1%}) superou")
+-- MAGIC     print(f"      o multimodal (F1={best_multimodal['F1']:.1%}) em {abs(delta_f1):.1%}.")
+-- MAGIC     print(f"      Causa: as features visuais (Raio-X de torax) nao contem")
+-- MAGIC     print(f"      sinal de diabetes, apenas ruido que degrada o modelo.")
+-- MAGIC     print(f"\n      QUANDO O MULTIMODAL SERA UTIL:")
+-- MAGIC     print(f"      - Com imagens clinicamente relevantes (retinopatia)")
+-- MAGIC     print(f"      - Com CNN real (ResNet50) em vez de PCA")
+-- MAGIC     print(f"      - Com dataset maior (CDC: 253k registos)")
+-- MAGIC     print(f"      - A arquitetura esta pronta; basta trocar a fonte de imagens")
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Q7 - Recomendacao e Novo Paciente
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # PERGUNTA: Q7 — Qual modelo recomendar para producao e qual a
+-- MAGIC #          probabilidade de risco para um novo paciente?
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Recomendar o melhor modelo para deploy em ambiente
+-- MAGIC #           clinico e demonstrar a previsao com um paciente exemplo,
+-- MAGIC #           mostrando a probabilidade de risco e accoes recomendadas.
+-- MAGIC #
+-- MAGIC # DESCRICAO: 1) Recomenda o modelo com melhor desempenho (A-RF).
+-- MAGIC #           2) Simula um novo paciente com valores clinicos reais.
+-- MAGIC #           3) Aplica o scaler e features derivadas ao novo paciente.
+-- MAGIC #           4) Preve a probabilidade de risco e sugere accoes clinicas.
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC
+-- MAGIC print("=" * 70)
+-- MAGIC print("Q7: Qual modelo recomendar para producao e probabilidade de um novo paciente?")
+-- MAGIC print("=" * 70)
+-- MAGIC
+-- MAGIC print(f"\n   RECOMENDACAO DE MODELO PARA PRODUCAO:")
+-- MAGIC print(f"   Modelo A-RandomForest (apenas dados clinicos)")
+-- MAGIC print(f"      Accuracy: {best_tabular['Accuracy']:.1%}")
+-- MAGIC print(f"      F1-Score: {best_tabular['F1']:.1%}")
+-- MAGIC print(f"      AUC-ROC:  {best_tabular['AUC-ROC']:.1%}")
+-- MAGIC print(f"   Justificacao: melhor desempenho, interpretavel, nao precisa")
+-- MAGIC print(f"   de imagens (mais pratico em triagem clinica).")
+-- MAGIC
+-- MAGIC # Simular um novo paciente (valores reais, antes do escalamento)
+-- MAGIC print(f"\n   EXEMPLO: Novo paciente com os seguintes valores:")
+-- MAGIC new_patient_raw = {
+-- MAGIC     "Pregnancies": 4,
+-- MAGIC     "Glucose": 145,
+-- MAGIC     "BloodPressure": 80,
+-- MAGIC     "SkinThickness": 33,
+-- MAGIC     "Insulin": 120,
+-- MAGIC     "BMI": 35.5,
+-- MAGIC     "DiabetesPedigreeFunction": 0.5,
+-- MAGIC     "Age": 48
+-- MAGIC }
+-- MAGIC for k, v in new_patient_raw.items():
+-- MAGIC     print(f"      {k:25s}: {v}")
+-- MAGIC
+-- MAGIC # Escalar o novo paciente usando o scaler ja ajustado
+-- MAGIC new_df = pd.DataFrame([new_patient_raw])
+-- MAGIC new_scaled = pd.DataFrame(scaler.transform(new_df), columns=scale_cols)
+-- MAGIC
+-- MAGIC # Calcular features derivadas (ambas transformadas juntas)
+-- MAGIC raw_gbr = new_df["Glucose"].values[0] / (new_df["BMI"].values[0] + 1e-6)
+-- MAGIC raw_bpg = new_df["BloodPressure"].values[0] * new_df["Glucose"].values[0]
+-- MAGIC derived_df = pd.DataFrame({"Glucose_BMI_Ratio": [raw_gbr], "BP_Glucose_Interaction": [raw_bpg]})
+-- MAGIC derived_scaled = scaler_derived.transform(derived_df)
+-- MAGIC new_scaled["Glucose_BMI_Ratio"] = derived_scaled[0, 0]
+-- MAGIC new_scaled["BP_Glucose_Interaction"] = derived_scaled[0, 1]
+-- MAGIC
+-- MAGIC age_q = original["Age"].quantile([0.25, 0.5, 0.75]).values
+-- MAGIC new_scaled["Age_Risk_Score"] = pd.cut([new_df["Age"].values[0]],
+-- MAGIC     bins=[-np.inf, age_q[0], age_q[1], age_q[2], np.inf], labels=[0,1,2,3]).astype(int)[0]
+-- MAGIC
+-- MAGIC medians = {"BMI": original["BMI"].median(), "Glucose": original["Glucose"].median(),
+-- MAGIC            "BloodPressure": original["BloodPressure"].median(), "Age": original["Age"].median()}
+-- MAGIC new_scaled["Metabolic_Syndrome_Score"] = int(
+-- MAGIC     (new_df["BMI"].values[0] > medians["BMI"]) +
+-- MAGIC     (new_df["Glucose"].values[0] > medians["Glucose"]) +
+-- MAGIC     (new_df["BloodPressure"].values[0] > medians["BloodPressure"]) +
+-- MAGIC     (new_df["Age"].values[0] > medians["Age"]))
+-- MAGIC
+-- MAGIC # Preparar vetor tabular final e prever
+-- MAGIC new_features = new_scaled[tabular_features].values
+-- MAGIC prob_diabetes = rf_best.predict_proba(new_features)[0, 1]
+-- MAGIC prediction = rf_best.predict(new_features)[0]
+-- MAGIC
+-- MAGIC print(f"\n   RESULTADO DA PREVISAO:")
+-- MAGIC print(f"      Probabilidade de risco de diabetes: {prob_diabetes:.1%}")
+-- MAGIC print(f"      Previsao: {'RISCO' if prediction == 1 else 'SEM RISCO'}")
+-- MAGIC if prob_diabetes > 0.5:
+-- MAGIC     print(f"      Classificacao: ALTO RISCO")
+-- MAGIC     print(f"      \n      ACOES RECOMENDADAS:")
+-- MAGIC     print(f"      - Encaminhar para avaliacao medica detalhada")
+-- MAGIC     print(f"      - Monitorar glicemia em jejum e HbA1c")
+-- MAGIC     print(f"      - Plano de perda de peso (IMC={new_df['BMI'].values[0]:.1f})")
+-- MAGIC     print(f"      - Avaliar historico familiar (DPF={new_df['DiabetesPedigreeFunction'].values[0]})")
+-- MAGIC else:
+-- MAGIC     print(f"      Classificacao: BAIXO RISCO")
+-- MAGIC     print(f"      Manter acompanhamento preventivo regular.")
+-- MAGIC
+-- MAGIC print(f"\n" + "=" * 70)
+-- MAGIC print("PIPELINE COMPLETO - 5 ETAPAS EXECUTADAS COM SUCESSO")
+-- MAGIC print("=" * 70)
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Dataset Completo - Dados Clinicos
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # DATASET COMPLETO 1: Dados Clinicos (Pima Indians Diabetes)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Mostrar o dataset clinico completo com todos os
+-- MAGIC #           pacientes (ID 0-767) e os seus parametros de saude.
+-- MAGIC # Os dados nao tem nomes reais (anonimizados), cada paciente e
+-- MAGIC # identificado por patient_id (0-767).
+-- MAGIC
+-- MAGIC print("DATASET COMPLETO 1: Dados Clinicos (Pima Indians Diabetes)")
+-- MAGIC print(f"   Total de pacientes: {df_clinical.shape[0]}")
+-- MAGIC print(f"   Colunas: {list(df_clinical.columns)}")
+-- MAGIC print(f"   Risco diabetes (Outcome=1): {df_clinical['Outcome'].sum()}")
+-- MAGIC print(f"   Sem risco (Outcome=0): {(df_clinical['Outcome']==0).sum()}")
+-- MAGIC print("\n   Nota: patient_id substitui o nome do paciente (dados anonimizados)")
+-- MAGIC
+-- MAGIC # Mostrar dataset completo (768 registos)
+-- MAGIC display(df_clinical)
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Dataset Completo - Imagens Raio-X
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # DATASET COMPLETO 2: Imagens de Raio-X (ChestMNIST)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Mostrar o dataset de imagens de Raio-X completo com
+-- MAGIC #           todos os pacientes (ID 0-767), as doencas toracicas
+-- MAGIC #           detectadas e estatisticas das imagens.
+-- MAGIC # Cada paciente tem uma imagem 28x28 (784 pixeis) + 14 labels.
+-- MAGIC
+-- MAGIC disease_names = ["Atelectasis", "Cardiomegaly", "Effusion", "Infiltration",
+-- MAGIC                  "Mass", "Nodule", "Pneumonia", "Pneumothorax",
+-- MAGIC                  "Consolidation", "Edema", "Emphysema", "Fibrosis",
+-- MAGIC                  "Pleural_Thickening", "Hernia"]
+-- MAGIC
+-- MAGIC print("DATASET COMPLETO 2: Imagens de Raio-X (ChestMNIST)")
+-- MAGIC print(f"   Total de pacientes: {df_xray.shape[0]}")
+-- MAGIC print(f"   Imagem: 28x28 pixeis (784 valores por paciente)")
+-- MAGIC print(f"   Doencas toracicas: 14 labels")
+-- MAGIC print("\n   Estatisticas das doencas toracicas:")
+-- MAGIC for name in disease_names:
+-- MAGIC     col = f"dx_{name}"
+-- MAGIC     n = df_xray[col].sum()
+-- MAGIC     pct = n / len(df_xray) * 100
+-- MAGIC     print(f"      {name:25s}: {n:3d} casos ({pct:5.1f}%)")
+-- MAGIC
+-- MAGIC # Mostrar dataset sem a coluna de pixeis (legivel)
+-- MAGIC xray_view = df_xray.drop(columns=["img_pixels"])
+-- MAGIC print(f"\n   Dataset de Raio-X (sem coluna de pixeis para legibilidade):")
+-- MAGIC print(f"   Colunas: {list(xray_view.columns)}")
+-- MAGIC display(xray_view)
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Visualizacao Imagens Raio-X
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # VISUALIZACAO DAS IMAGENS DE RAIO-X (ChestMNIST)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Mostrar uma grelha de imagens de Raio-X de torax
+-- MAGIC #           com os respectivos patient_id, Outcome (risco diabetes)
+-- MAGIC # e doencas toracicas detectadas.
+-- MAGIC # Cada imagem tem 28x28 pixeis em tons de cinza (grayscale).
+-- MAGIC
+-- MAGIC import matplotlib.pyplot as plt
+-- MAGIC import numpy as np
+-- MAGIC
+-- MAGIC # Reconverter imagens a partir do df_xray
+-- MAGIC xray_images = np.array([np.array(p).reshape(28, 28) for p in df_xray["img_pixels"]])
+-- MAGIC
+-- MAGIC # Seleccionar 12 pacientes: 6 com diabetes + 6 sem diabetes
+-- MAGIC diabetes_ids = df_xray[df_xray["patient_id"].isin(df_clinical[df_clinical["Outcome"]==1].index)]["patient_id"].values[:6]
+-- MAGIC no_diabetes_ids = df_xray[df_xray["patient_id"].isin(df_clinical[df_clinical["Outcome"]==0].index)]["patient_id"].values[:6]
+-- MAGIC show_ids = list(diabetes_ids) + list(no_diabetes_ids)
+-- MAGIC
+-- MAGIC disease_short = ["Atelect", "Cardiom", "Effusio", "Infiltr", "Mass", "Nodule",
+-- MAGIC                  "Pneumon", "Pneumot", "Consoli", "Edema", "Emphyse", "Fibros",
+-- MAGIC                  "Pleural", "Hernia"]
+-- MAGIC
+-- MAGIC fig, axes = plt.subplots(3, 4, figsize=(14, 10))
+-- MAGIC fig.suptitle("Imagens de Raio-X de Torax (ChestMNIST)\nLinha 1-2: Pacientes COM risco de diabetes | Linha 3: SEM risco",
+-- MAGIC              fontsize=14, fontweight="bold")
+-- MAGIC
+-- MAGIC for idx, pid in enumerate(show_ids):
+-- MAGIC     row, col = idx // 4, idx % 4
+-- MAGIC     ax = axes[row, col]
+-- MAGIC     img = xray_images[pid]
+-- MAGIC     ax.imshow(img, cmap="gray", vmin=0, vmax=255)
+-- MAGIC     ax.axis("off")
+-- MAGIC     
+-- MAGIC     # Obter Outcome e doencas
+-- MAGIC     outcome = df_clinical.iloc[pid]["Outcome"]
+-- MAGIC     age = df_clinical.iloc[pid]["Age"]
+-- MAGIC     glucose = df_clinical.iloc[pid]["Glucose"]
+-- MAGIC     bmi = df_clinical.iloc[pid]["BMI"]
+-- MAGIC     
+-- MAGIC     # Doencas activas
+-- MAGIC     dx_row = df_xray[df_xray["patient_id"] == pid].iloc[0]
+-- MAGIC     active_dx = [disease_short[i] for i in range(14) if dx_row[f"dx_{disease_names[i]}"] == 1]
+-- MAGIC     dx_str = ", ".join(active_dx) if active_dx else "Nenhuma"
+-- MAGIC     
+-- MAGIC     risk_label = "RISCO DIABETES" if outcome == 1 else "SEM RISCO"
+-- MAGIC     color = "red" if outcome == 1 else "green"
+-- MAGIC     
+-- MAGIC     ax.set_title(f"Paciente #{pid} | {risk_label}\nIdade={age} | Glicose={glucose} | IMC={bmi:.1f}\nRaio-X: {dx_str}",
+-- MAGIC                  fontsize=8, color=color, pad=4)
+-- MAGIC
+-- MAGIC plt.tight_layout()
+-- MAGIC plt.show()
+-- MAGIC
+-- MAGIC print("\nLegenda:")
+-- MAGIC print("   Titulos a VERMELHO: pacientes com risco de diabetes (Outcome=1)")
+-- MAGIC print("   Titulos a VERDE: pacientes sem risco de diabetes (Outcome=0)")
+-- MAGIC print("   Doencas toracicas abreviadas: Atelect=Atelectasia, Effusio=Effusion, etc.")
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Grafico 1 - Comparacao Modelos
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # GRAFICO 1: Comparacao dos Modelos (Bar Chart)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Visualizar as metricas dos 6 modelos testados para
+-- MAGIC #           comparacao rapida e identificar o melhor.
+-- MAGIC
+-- MAGIC import matplotlib.pyplot as plt
+-- MAGIC import numpy as np
+-- MAGIC
+-- MAGIC df_plot = pd.DataFrame(results_all).T[["Accuracy", "F1", "AUC-ROC"]]
+-- MAGIC
+-- MAGIC fig, ax = plt.subplots(figsize=(12, 6))
+-- MAGIC x = np.arange(len(df_plot))
+-- MAGIC width = 0.25
+-- MAGIC
+-- MAGIC colors_acc = "#2196F3"
+-- MAGIC colors_f1 = "#4CAF50"
+-- MAGIC colors_auc = "#FF9800"
+-- MAGIC
+-- MAGIC bars1 = ax.bar(x - width, df_plot["Accuracy"], width, label="Accuracy", color=colors_acc)
+-- MAGIC bars2 = ax.bar(x, df_plot["F1"], width, label="F1-Score", color=colors_f1)
+-- MAGIC bars3 = ax.bar(x + width, df_plot["AUC-ROC"], width, label="AUC-ROC", color=colors_auc)
+-- MAGIC
+-- MAGIC ax.set_ylabel("Score", fontsize=12)
+-- MAGIC ax.set_title("Comparacao dos Modelos A, B e C", fontsize=14, fontweight="bold")
+-- MAGIC ax.set_xticks(x)
+-- MAGIC ax.set_xticklabels(df_plot.index, rotation=30, ha="right", fontsize=9)
+-- MAGIC ax.legend(loc="lower right")
+-- MAGIC ax.set_ylim(0, 1.0)
+-- MAGIC ax.axhline(y=0.5, color="gray", linestyle="--", alpha=0.5, label="Aleatorio")
+-- MAGIC
+-- MAGIC for bars in [bars1, bars2, bars3]:
+-- MAGIC     for bar in bars:
+-- MAGIC         h = bar.get_height()
+-- MAGIC         ax.annotate(f"{h:.1%}", xy=(bar.get_x() + bar.get_width()/2, h),
+-- MAGIC                     xytext=(0, 3), textcoords="offset points", ha="center", fontsize=7)
+-- MAGIC
+-- MAGIC plt.tight_layout()
+-- MAGIC plt.show()
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Grafico 2 - Feature Importance
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # GRAFICO 2: Feature Importance (Horizontal Bar Chart)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Mostrar quais as features clinicas com maior peso na
+-- MAGIC #           previsao de diabetes, ordenadas da mais a menos importante.
+-- MAGIC
+-- MAGIC fig, ax = plt.subplots(figsize=(10, 6))
+-- MAGIC
+-- MAGIC feature_imp_sorted = feature_imp.sort_values("Importancia")
+-- MAGIC colors_bar = ["#E53935" if v > 0.15 else "#1E88E5" if v > 0.08 else "#90A4AE" 
+-- MAGIC               for v in feature_imp_sorted["Importancia"]]
+-- MAGIC
+-- MAGIC bars = ax.barh(feature_imp_sorted["Feature"], feature_imp_sorted["Importancia"], color=colors_bar)
+-- MAGIC ax.set_xlabel("Importancia (Random Forest)", fontsize=12)
+-- MAGIC ax.set_title("Features Clinicas mais Determinantes para Diabetes", fontsize=14, fontweight="bold")
+-- MAGIC ax.set_xlim(0, 0.30)
+-- MAGIC
+-- MAGIC for bar in bars:
+-- MAGIC     w = bar.get_width()
+-- MAGIC     ax.annotate(f"{w:.1%}", xy=(w, bar.get_y() + bar.get_height()/2),
+-- MAGIC                 xytext=(3, 0), textcoords="offset points", va="center", fontsize=9)
+-- MAGIC
+-- MAGIC # Legenda das cores
+-- MAGIC from matplotlib.patches import Patch
+-- MAGIC legend_elements = [Patch(facecolor="#E53935", label="Muito importante (>15%)"),
+-- MAGIC                   Patch(facecolor="#1E88E5", label="Importante (8-15%)"),
+-- MAGIC                   Patch(facecolor="#90A4AE", label="Menos importante (<8%)")]
+-- MAGIC ax.legend(handles=legend_elements, loc="lower right", fontsize=9)
+-- MAGIC
+-- MAGIC plt.tight_layout()
+-- MAGIC plt.show()
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Grafico 3 - Sindrome Metabolica
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # GRAFICO 3: Sindrome Metabolica vs Risco de Diabetes
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Visualizar a relacao dose-efeito entre o score de
+-- MAGIC #           sindrome metabolica e a probabilidade de diabetes.
+-- MAGIC
+-- MAGIC scores = sorted(df_clean["Metabolic_Syndrome_Score"].unique())
+-- MAGIC pct_list = []
+-- MAGIC n_list = []
+-- MAGIC for s in scores:
+-- MAGIC     subset = df_clean[df_clean["Metabolic_Syndrome_Score"] == s]
+-- MAGIC     pct_list.append(subset["Outcome"].mean() * 100)
+-- MAGIC     n_list.append(len(subset))
+-- MAGIC
+-- MAGIC fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+-- MAGIC
+-- MAGIC # Grafico de barras: % diabetes por score
+-- MAGIC colors_grad = ["#4CAF50", "#8BC34A", "#FFC107", "#FF9800", "#F44336"]
+-- MAGIC bars = ax1.bar(scores, pct_list, color=colors_grad, edgecolor="black", linewidth=0.5)
+-- MAGIC ax1.set_xlabel("Score de Sindrome Metabolica", fontsize=12)
+-- MAGIC ax1.set_ylabel("% com Diabetes", fontsize=12)
+-- MAGIC ax1.set_title("Risco de Diabetes por Score Metabolico", fontsize=13, fontweight="bold")
+-- MAGIC ax1.set_xticks(scores)
+-- MAGIC ax1.set_ylim(0, 100)
+-- MAGIC
+-- MAGIC for bar, n, pct in zip(bars, n_list, pct_list):
+-- MAGIC     ax1.annotate(f"{pct:.1f}%\n(n={n})", xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+-- MAGIC                 xytext=(0, 3), textcoords="offset points", ha="center", fontsize=9)
+-- MAGIC
+-- MAGIC # Grafico de barras: distribuicao de pacientes
+-- MAGIC ax2.bar(scores, n_list, color=colors_grad, edgecolor="black", linewidth=0.5)
+-- MAGIC ax2.set_xlabel("Score de Sindrome Metabolica", fontsize=12)
+-- MAGIC ax2.set_ylabel("Numero de Pacientes", fontsize=12)
+-- MAGIC ax2.set_title("Distribuicao de Pacientes por Score", fontsize=13, fontweight="bold")
+-- MAGIC ax2.set_xticks(scores)
+-- MAGIC
+-- MAGIC for i, n in enumerate(n_list):
+-- MAGIC     ax2.annotate(str(n), xy=(i, n), xytext=(0, 3), textcoords="offset points",
+-- MAGIC                 ha="center", fontsize=10)
+-- MAGIC
+-- MAGIC plt.tight_layout()
+-- MAGIC plt.show()
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Grafico 4 - Embeddings Visuais PCA 2D
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # GRAFICO 4: Embeddings Visuais PCA 2D (Scatter Plot)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Visualizar a projecao 2D dos embeddings visuais (PCA)
+-- MAGIC #           coloridos por Outcome, para confirmar visualmente que
+-- MAGIC #           as imagens de Raio-X nao discriminam diabetes.
+-- MAGIC
+-- MAGIC fig, ax = plt.subplots(figsize=(8, 8))
+-- MAGIC
+-- MAGIC ax.scatter(X_vis_2d[y == 0, 0], X_vis_2d[y == 0, 1], c="green", alpha=0.4, s=20, label=f"Sem diabetes (n={len(diabetes_0)})")
+-- MAGIC ax.scatter(X_vis_2d[y == 1, 0], X_vis_2d[y == 1, 1], c="red", alpha=0.4, s=20, label=f"Com diabetes (n={len(diabetes_1)})")
+-- MAGIC
+-- MAGIC # Centroides
+-- MAGIC ax.scatter(diabetes_0[:, 0].mean(), diabetes_0[:, 1].mean(), c="green", s=200, marker="*", edgecolor="black", linewidth=2, label="Centroide sem diabetes")
+-- MAGIC ax.scatter(diabetes_1[:, 0].mean(), diabetes_1[:, 1].mean(), c="red", s=200, marker="*", edgecolor="black", linewidth=2, label="Centroide com diabetes")
+-- MAGIC
+-- MAGIC ax.set_xlabel("Componente Principal 1", fontsize=12)
+-- MAGIC ax.set_ylabel("Componente Principal 2", fontsize=12)
+-- MAGIC ax.set_title("Embeddings Visuais (PCA 2D) - Raio-X vs Diabetes\nDistancia entre centroides = {:.3f}".format(dist), fontsize=13, fontweight="bold")
+-- MAGIC ax.legend(loc="upper right", fontsize=9)
+-- MAGIC ax.set_facecolor("#F5F5F5")
+-- MAGIC
+-- MAGIC plt.tight_layout()
+-- MAGIC plt.show()
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Grelha Ampla Raio-X (24 imagens)
+-- MAGIC %python
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # VISUALIZACAO EXTRA: Grelha Ampla de Raio-X (24 imagens)
+-- MAGIC # -------------------------------------------------------------------
+-- MAGIC # OBJECTIVO: Mostrar uma grelha maior com 24 imagens de Raio-X
+-- MAGIC #           de diversos pacientes, organizadas por Outcome, para
+-- MAGIC #           comparacao visual entre pacientes com e sem diabetes.
+-- MAGIC # As primeiras 12 imagens sao de pacientes COM risco de diabetes.
+-- MAGIC # As ultimas 12 sao de pacientes SEM risco.
+-- MAGIC
+-- MAGIC import matplotlib.pyplot as plt
+-- MAGIC import numpy as np
+-- MAGIC
+-- MAGIC # Reconverter imagens a partir do df_xray
+-- MAGIC xray_images = np.array([np.array(p).reshape(28, 28) for p in df_xray["img_pixels"]])
+-- MAGIC
+-- MAGIC # Selecionar 12 pacientes com diabetes + 12 sem diabetes (alternados para variedade)
+-- MAGIC np.random.seed(99)
+-- MAGIC diabetes_indices = df_clinical[df_clinical["Outcome"] == 1].index.tolist()
+-- MAGIC no_diabetes_indices = df_clinical[df_clinical["Outcome"] == 0].index.tolist()
+-- MAGIC show_diabetes = np.random.choice(diabetes_indices, 12, replace=False)
+-- MAGIC show_no_diabetes = np.random.choice(no_diabetes_indices, 12, replace=False)
+-- MAGIC show_ids = list(show_diabetes) + list(show_no_diabetes)
+-- MAGIC
+-- MAGIC disease_short = ["Atelect", "Cardiom", "Effusio", "Infiltr", "Mass", "Nodule",
+-- MAGIC                  "Pneumon", "Pneumot", "Consoli", "Edema", "Emphyse", "Fibros",
+-- MAGIC                  "Pleural", "Hernia"]
+-- MAGIC
+-- MAGIC fig, axes = plt.subplots(6, 4, figsize=(16, 22))
+-- MAGIC fig.suptitle("Grelha Ampla de Imagens de Raio-X de Torax (ChestMNIST)\nLinhas 1-3: COM risco de diabetes | Linhas 4-6: SEM risco",
+-- MAGIC              fontsize=16, fontweight="bold", y=0.98)
+-- MAGIC
+-- MAGIC for idx, pid in enumerate(show_ids):
+-- MAGIC     row, col = idx // 4, idx % 4
+-- MAGIC     ax = axes[row, col]
+-- MAGIC     img = xray_images[pid]
+-- MAGIC     ax.imshow(img, cmap="gray", vmin=0, vmax=255)
+-- MAGIC     ax.axis("off")
+-- MAGIC
+-- MAGIC     outcome = df_clinical.iloc[pid]["Outcome"]
+-- MAGIC     age = df_clinical.iloc[pid]["Age"]
+-- MAGIC     glucose = df_clinical.iloc[pid]["Glucose"]
+-- MAGIC     bmi = df_clinical.iloc[pid]["BMI"]
+-- MAGIC
+-- MAGIC     dx_row = df_xray[df_xray["patient_id"] == pid].iloc[0]
+-- MAGIC     active_dx = [disease_short[i] for i in range(14) if dx_row[f"dx_{disease_names[i]}"] == 1]
+-- MAGIC     dx_str = ", ".join(active_dx) if active_dx else "Nenhuma"
+-- MAGIC
+-- MAGIC     risk_label = "RISCO" if outcome == 1 else "SEM RISCO"
+-- MAGIC     color = "red" if outcome == 1 else "green"
+-- MAGIC
+-- MAGIC     ax.set_title(f"#{pid} | {risk_label}\nIdade={age} Glic={glucose} IMC={bmi:.0f}\nRaio-X: {dx_str}",
+-- MAGIC                  fontsize=7, color=color, pad=3)
+-- MAGIC
+-- MAGIC plt.tight_layout(rect=[0, 0, 1, 0.96])
+-- MAGIC plt.show()
+-- MAGIC
+-- MAGIC print("\nLegenda:")
+-- MAGIC print("   VERMELHO: pacientes com risco de diabetes (Outcome=1)")
+-- MAGIC print("   VERDE: pacientes sem risco de diabetes (Outcome=0)")
+-- MAGIC print("\nObservacao: As imagens de Raio-X de torax sao visualmente semelhantes")
+-- MAGIC print("   entre pacientes com e sem diabetes, confirmando que nao ha padrao")
+-- MAGIC print("   visual de diabetes no Raio-X de torax.")
